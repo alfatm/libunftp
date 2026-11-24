@@ -182,6 +182,14 @@ async fn send_reply(tx: &Sender<ControlChanMsg>, logger: &slog::Logger, reply: R
     }
 }
 
+/// Answers a transfer command whose data connection could not be set up, such as one on which the
+/// client's TLS handshake failed. RFC 959 section 5.4 lists 425 among the replies that may follow the
+/// 150 of a transfer command.
+async fn data_connection_failed(tx: &Sender<ControlChanMsg>, logger: &slog::Logger, command: &str, err: std::io::Error) {
+    slog::warn!(logger, "Could not open the data connection for {}: {:?}", command, err);
+    send_reply(tx, logger, Reply::new(ReplyCode::CantOpenDataConnection, "Can't open data connection")).await;
+}
+
 impl<Storage, User> DataCommandExecutor<Storage, User>
 where
     Storage: StorageBackend<User> + 'static,
@@ -262,7 +270,11 @@ where
     async fn exec_retr(self, path: String, start_pos: u64) {
         let path = self.cwd.join(path);
         let tx: Sender<ControlChanMsg> = self.control_msg_tx.clone();
-        let mut output = Self::writer(self.socket, self.ftps_mode, "retr").await;
+        let output = Self::writer(self.socket, self.ftps_mode, "retr").await;
+        let mut output = match output {
+            Ok(output) => output,
+            Err(err) => return data_connection_failed(&tx, &self.logger, "RETR", err).await,
+        };
 
         let start_time = Instant::now();
         let result = self
@@ -358,10 +370,15 @@ where
         let path = self.cwd.join(path);
         let tx = self.control_msg_tx.clone();
 
+        let input = Self::reader(self.socket, self.ftps_mode, "stor").await;
+        let input = match input {
+            Ok(input) => input,
+            Err(err) => return data_connection_failed(&tx, &self.logger, "STOR", err).await,
+        };
         let start_time = Instant::now();
         let (abort_tx, abort_rx) = oneshot::channel();
         let aborted = Arc::new(AtomicBool::new(false));
-        let input = AbortableReader::new(Self::reader(self.socket, self.ftps_mode, "stor").await, abort_rx, Arc::clone(&aborted));
+        let input = AbortableReader::new(input, abort_rx, Arc::clone(&aborted));
         let put = self.storage.put((*self.user).as_ref().unwrap(), input, path.clone(), start_pos);
         let (put_result, abor_received) = until_complete_or_aborted(put, abort_tx, data_abort_rx).await;
         let duration = start_time.elapsed();
@@ -449,10 +466,15 @@ where
             }
         };
 
+        let input = Self::reader(self.socket, self.ftps_mode, "appe").await;
+        let input = match input {
+            Ok(input) => input,
+            Err(err) => return data_connection_failed(&tx, &self.logger, "APPE", err).await,
+        };
         let start_time = Instant::now();
         let (abort_tx, abort_rx) = oneshot::channel();
         let aborted = Arc::new(AtomicBool::new(false));
-        let input = AbortableReader::new(Self::reader(self.socket, self.ftps_mode, "appe").await, abort_rx, Arc::clone(&aborted));
+        let input = AbortableReader::new(input, abort_rx, Arc::clone(&aborted));
         let put = self.storage.put((*self.user).as_ref().unwrap(), input, path.clone(), start_pos);
         let (put_result, abor_received) = until_complete_or_aborted(put, abort_tx, data_abort_rx).await;
         let duration = start_time.elapsed();
@@ -513,7 +535,11 @@ where
     async fn exec_list_variant(self, path: Option<String>, command: ListCommand) {
         let path = self.resolve_path(path);
         let tx = self.control_msg_tx.clone();
-        let mut output = Self::writer(self.socket, self.ftps_mode.clone(), command.as_lower_str()).await;
+        let output = Self::writer(self.socket, self.ftps_mode.clone(), command.as_lower_str()).await;
+        let mut output = match output {
+            Ok(output) => output,
+            Err(err) => return data_connection_failed(&tx, &self.logger, command.as_str(), err).await,
+        };
 
         let start_time = Instant::now();
 
@@ -601,7 +627,11 @@ where
     async fn exec_mlsd(self, path: Option<String>) {
         let path = self.resolve_path(path);
         let tx = self.control_msg_tx.clone();
-        let mut output = Self::writer(self.socket, self.ftps_mode.clone(), "mlsd").await;
+        let output = Self::writer(self.socket, self.ftps_mode.clone(), "mlsd").await;
+        let mut output = match output {
+            Ok(output) => output,
+            Err(err) => return data_connection_failed(&tx, &self.logger, "MLSD", err).await,
+        };
 
         let start_time = Instant::now();
 
@@ -692,36 +722,30 @@ where
         }
     }
 
+    /// The data connection to send to, once the TLS handshake on it, if any, has succeeded.
     #[tracing_attributes::instrument]
-    async fn writer(socket: TcpStream, ftps_mode: FtpsConfig, command: &'static str) -> Box<dyn AsyncWrite + Send + Unpin + Sync> {
+    async fn writer(socket: TcpStream, ftps_mode: FtpsConfig, command: &'static str) -> std::io::Result<Box<dyn AsyncWrite + Send + Unpin + Sync>> {
         match ftps_mode {
-            FtpsConfig::Off => Box::new(MeasuringWriter::new(socket, command)) as Box<dyn AsyncWrite + Send + Unpin + Sync>,
+            FtpsConfig::Off => Ok(Box::new(MeasuringWriter::new(socket, command))),
             FtpsConfig::Building { .. } => panic!("Illegal state"),
             FtpsConfig::On { tls_config } => {
-                let io = async move {
-                    let acceptor: TlsAcceptor = tls_config.into();
-                    let tls_stream = acceptor.accept(socket).await.unwrap();
-                    MeasuringWriter::new(tls_stream, command)
-                }
-                .await;
-                Box::new(io) as Box<dyn AsyncWrite + Send + Unpin + Sync>
+                let acceptor: TlsAcceptor = tls_config.into();
+                let tls_stream = acceptor.accept(socket).await?;
+                Ok(Box::new(MeasuringWriter::new(tls_stream, command)))
             }
         }
     }
 
+    /// The data connection to receive from, once the TLS handshake on it, if any, has succeeded.
     #[tracing_attributes::instrument]
-    async fn reader(socket: TcpStream, ftps_mode: FtpsConfig, command: &'static str) -> Box<dyn AsyncRead + Send + Unpin + Sync> {
+    async fn reader(socket: TcpStream, ftps_mode: FtpsConfig, command: &'static str) -> std::io::Result<Box<dyn AsyncRead + Send + Unpin + Sync>> {
         match ftps_mode {
-            FtpsConfig::Off => Box::new(MeasuringReader::new(socket, command)) as Box<dyn AsyncRead + Send + Unpin + Sync>,
+            FtpsConfig::Off => Ok(Box::new(MeasuringReader::new(socket, command))),
             FtpsConfig::Building { .. } => panic!("Illegal state"),
             FtpsConfig::On { tls_config } => {
-                let io = async move {
-                    let acceptor: TlsAcceptor = tls_config.into();
-                    let tls_stream = acceptor.accept(socket).await.unwrap();
-                    MeasuringReader::new(tls_stream, command)
-                }
-                .await;
-                Box::new(io) as Box<dyn AsyncRead + Send + Unpin + Sync>
+                let acceptor: TlsAcceptor = tls_config.into();
+                let tls_stream = acceptor.accept(socket).await?;
+                Ok(Box::new(MeasuringReader::new(tls_stream, command)))
             }
         }
     }

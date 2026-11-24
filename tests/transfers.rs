@@ -13,6 +13,8 @@ use common::{TestAuthenticator, tcp_pasv_connect};
 use lazy_static::lazy_static;
 use libunftp::ServerBuilder;
 use libunftp::options::ActivePassiveMode;
+use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+use rustls::{ClientConfig, RootCertStore};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Cursor;
@@ -25,10 +27,17 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_rustls::TlsConnector;
 use unftp_core::auth::DefaultUser;
 use unftp_core::storage::{Error, ErrorKind, FEATURE_RESTART, Fileinfo, Metadata, Result, StorageBackend};
 
 const ADDR: &str = "127.0.0.1:2157";
+
+/// The same server with FTPS configured, for tests that secure the data connection.
+const FTPS_ADDR: &str = "127.0.0.1:2158";
+const CERTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/resources/ftps/server.pem");
+const KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/resources/ftps/server.key");
+const CA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/resources/ftps/ca.pem");
 
 /// How long a test waits for a reply or an event before it fails.
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -48,6 +57,19 @@ const WATCHED: &str = "watched";
 /// Like [`WATCHED`], and the backend holds the transfer until the probe releases it: `put` once it has
 /// read to EOF, `get_into` once it has sent the first half of [`CONTENT`].
 const HELD: &str = "held";
+
+/// Opens the data connection at `addr` and secures it with TLS. The server takes the handshake only once
+/// it has the transfer command.
+async fn tls_pasv_connect(addr: SocketAddr) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(CA).unwrap() {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let data = tcp_pasv_connect(addr).await.unwrap();
+    let handshake = TlsConnector::from(Arc::new(config)).connect(ServerName::try_from("localhost").unwrap(), data);
+    tokio::time::timeout(PATIENCE, handshake).await.expect("no TLS handshake in time").unwrap()
+}
 
 /// What a [`probe`] reports of the backend's work on a file.
 #[derive(Debug, PartialEq)]
@@ -247,14 +269,16 @@ impl StorageBackend<DefaultUser> for TestStorage {
     }
 }
 
-async fn run_with_test_storage() {
-    let server = ServerBuilder::new(Box::new(|| TestStorage))
+async fn run_with_test_storage(addr: &'static str, ftps: bool) {
+    let mut builder = ServerBuilder::new(Box::new(|| TestStorage))
         .authenticator(Arc::new(TestAuthenticator {}))
         .greeting("Welcome test")
-        .active_passive_mode(ActivePassiveMode::ActiveAndPassive)
-        .build()
-        .unwrap();
-    server.listen(ADDR).await.unwrap();
+        .active_passive_mode(ActivePassiveMode::ActiveAndPassive);
+    if ftps {
+        builder = builder.ftps(CERTS, KEY);
+    }
+    let server = builder.build().unwrap();
+    server.listen(addr).await.unwrap();
 }
 
 async fn initialize() {
@@ -262,7 +286,8 @@ async fn initialize() {
     let mut lock = count.lock().await;
     *lock += 1;
     if *lock == 1 {
-        tokio::spawn(run_with_test_storage());
+        tokio::spawn(run_with_test_storage(ADDR, false));
+        tokio::spawn(run_with_test_storage(FTPS_ADDR, true));
     }
     drop(lock);
 }
@@ -292,9 +317,13 @@ struct Client {
 
 impl Client {
     async fn login() -> Client {
+        Client::login_to(ADDR).await
+    }
+
+    async fn login_to(addr: &str) -> Client {
         let mut errcount = 0;
         let stream = loop {
-            let connected = TcpStream::connect(ADDR).await;
+            let connected = TcpStream::connect(addr).await;
             match connected {
                 Ok(stream) => break stream,
                 Err(err) if errcount > 2 => panic!("could not connect to the test server: {err}"),
@@ -343,7 +372,7 @@ impl Client {
     }
 }
 
-async fn read_to_end(mut data: TcpStream) -> String {
+async fn read_to_end(mut data: impl AsyncRead + Unpin) -> String {
     let mut content = String::new();
     let read = tokio::time::timeout(PATIENCE, data.read_to_string(&mut content)).await;
     read.expect("the data connection was not closed in time").unwrap();
@@ -604,6 +633,33 @@ async fn no_new_data_connection_during_a_transfer() {
     read_to_end(data).await;
     assert_eq!(client.reply().await, "226 Successfully sent");
     client.pasv().await;
+
+    finalize().await;
+}
+
+// A data connection whose TLS handshake fails cannot carry the transfer. RFC 959 section 5.4 lists 425
+// "Can't open data connection" among the replies that may follow the 150 of a transfer command. The
+// session keeps working, and its next data connection carries a transfer.
+#[tokio::test(flavor = "current_thread")]
+async fn failed_tls_handshake_on_the_data_connection_gets_425() {
+    initialize().await;
+    let mut client = Client::login_to(FTPS_ADDR).await;
+    client.command("PBSZ 0", "200 OK").await;
+    client.command("PROT P", "200 PROT OK. Securing data channel").await;
+
+    let addr = client.pasv().await;
+    let mut data = tcp_pasv_connect(addr).await.unwrap();
+    data.write_all(b"plain text, not a TLS handshake\r\n").await.unwrap();
+    data.shutdown().await.unwrap();
+    client.command("RETR content.txt", "150 Sending data").await;
+    assert_eq!(client.reply().await, "425 Can't open data connection");
+    drop(data);
+    client.command("NOOP", "200 Successfully did nothing").await;
+
+    let addr = client.pasv().await;
+    client.command("RETR content.txt", "150 Sending data").await;
+    assert_eq!(read_to_end(tls_pasv_connect(addr).await).await, CONTENT);
+    assert_eq!(client.reply().await, "226 Successfully sent");
 
     finalize().await;
 }
