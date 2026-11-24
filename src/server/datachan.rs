@@ -112,8 +112,16 @@ where
         // TODO: Use configured timeout
         tokio::select! {
             Some(command) = data_cmd_rx.recv() => {
-                let session = session_arc.lock().await;
-                self.handle_incoming(DataChanMsg::ExternalCommand(command), session.start_pos).await;
+                let start_pos = match command {
+                    // A REST offset applies only to the transfer command that immediately follows it
+                    // (RFC 3659, section 5), so that command consumes it whatever its outcome.
+                    DataChanCmd::Retr { .. } | DataChanCmd::Stor { .. } | DataChanCmd::Appe { .. } => {
+                        let mut session = session_arc.lock().await;
+                        std::mem::take(&mut session.start_pos)
+                    }
+                    DataChanCmd::List { .. } | DataChanCmd::Nlst { .. } | DataChanCmd::Mlsd { .. } => 0,
+                };
+                self.handle_incoming(DataChanMsg::ExternalCommand(command), start_pos).await;
             },
             Some(_) = data_abort_rx.recv() => {
                 self.handle_incoming(DataChanMsg::Abort, 0).await;
