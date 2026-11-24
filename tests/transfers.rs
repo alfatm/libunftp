@@ -1,9 +1,9 @@
 #![allow(missing_docs)]
 
-//! Data transfer state on the control connection: what a transfer leaves behind for the next one.
+//! Data transfers as the storage backend sees them, and what a transfer leaves behind for the next one.
 //!
 //! These tests run against a storage backend whose behaviour is chosen by the file name, so a test can
-//! make the backend fail at a precise point and look at what the next command receives.
+//! make the backend fail at a precise point, or watch what it reads.
 
 pub mod common;
 
@@ -17,9 +17,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use unftp_core::auth::DefaultUser;
 use unftp_core::storage::{Error, ErrorKind, FEATURE_RESTART, Fileinfo, Metadata, Result, StorageBackend};
 
@@ -31,8 +31,23 @@ const CONTENT: &str = "0123456789abcdef";
 /// `put` refuses files whose name starts with this.
 const REFUSED: &str = "refused";
 
+/// `put` reports to [`WATCHED_UPLOADS`] how it reads files whose name starts with this.
+const WATCHED: &str = "watched";
+
+#[derive(Debug, PartialEq)]
+enum UploadEvent {
+    /// The backend has read the first bytes.
+    Started,
+    /// The backend's reader ended: with the number of bytes read at EOF, or with the kind of the read error.
+    Ended(std::result::Result<u64, std::io::ErrorKind>),
+}
+
 lazy_static! {
     static ref CONSUMERS: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
+    static ref WATCHED_UPLOADS: (mpsc::UnboundedSender<UploadEvent>, Mutex<mpsc::UnboundedReceiver<UploadEvent>>) = {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (tx, Mutex::new(rx))
+    };
 }
 
 #[derive(Debug)]
@@ -105,10 +120,31 @@ impl StorageBackend<DefaultUser> for TestStorage {
         path: P,
         _start_pos: u64,
     ) -> Result<u64> {
-        if file_name(path.as_ref()).starts_with(REFUSED) {
+        let name = file_name(path.as_ref());
+        if name.starts_with(REFUSED) {
             return Err(Error::from(ErrorKind::PermissionDenied));
         }
-        Ok(tokio::io::copy(&mut input, &mut tokio::io::sink()).await?)
+        if !name.starts_with(WATCHED) {
+            return Ok(tokio::io::copy(&mut input, &mut tokio::io::sink()).await?);
+        }
+        let events = &WATCHED_UPLOADS.0;
+        let mut buffer = [0_u8; 1024];
+        let mut total = 0_u64;
+        let ended = loop {
+            let read = input.read(&mut buffer).await;
+            match read {
+                Ok(0) => break Ok(total),
+                Ok(n) => {
+                    if total == 0 {
+                        events.send(UploadEvent::Started).unwrap();
+                    }
+                    total += n as u64;
+                }
+                Err(err) => break Err(err),
+            }
+        };
+        events.send(UploadEvent::Ended(ended.as_ref().map(|n| *n).map_err(|err| err.kind()))).unwrap();
+        ended.map_err(|err| Error::new(ErrorKind::ConnectionClosed, err))
     }
 
     async fn del<P: AsRef<Path> + Send + Debug>(&self, _user: &DefaultUser, _path: P) -> Result<()> {
@@ -253,6 +289,53 @@ async fn rest_offset_is_consumed_by_a_failed_transfer() {
         "RETR after a failed restarted STOR must start at offset 0"
     );
     assert_eq!(read_from_server(&mut buffer, &stream).await, "226 Successfully sent\r\n");
+
+    finalize().await;
+}
+
+/// Reads replies until `count` lines have arrived, or until none has come for a while.
+async fn read_replies(stream: &TcpStream, count: usize) -> String {
+    let mut buffer = [0_u8; 1024];
+    let mut replies = String::new();
+    while replies.matches("\r\n").count() < count {
+        let read = tokio::time::timeout(Duration::from_secs(2), read_from_server(&mut buffer, stream)).await;
+        match read {
+            Ok(reply) => replies.push_str(reply),
+            Err(_) => break,
+        }
+    }
+    replies
+}
+
+// RFC 959 section 4.1.3: on ABOR while a transfer is in progress, "the server aborts the FTP service
+// in progress and closes the data connection, returning a 426 reply to indicate that the service
+// request terminated abnormally. The server then sends a 226 reply". The backend must see the abort
+// as a failed read, so that a client closing the data connection cleanly afterwards does not turn the
+// aborted upload into a finished one.
+#[tokio::test(flavor = "current_thread")]
+async fn abor_fails_the_upload_the_backend_is_reading() {
+    initialize().await;
+
+    let stream = tcp_connect().await.unwrap();
+    let mut buffer = vec![0_u8; 1024];
+    login(&stream, &mut buffer).await;
+    let mut events = WATCHED_UPLOADS.1.lock().await;
+
+    let addr = pasv(&stream, &mut buffer).await;
+    send_to_server(&format!("STOR {WATCHED}.txt\r\n"), &stream).await;
+    assert_eq!(read_from_server(&mut buffer, &stream).await, "150 Ready to receive data\r\n");
+    let mut data_stream = tcp_pasv_connect(addr).await.unwrap();
+    send_to_server("partial", &data_stream).await;
+    let started = tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap();
+    assert_eq!(started, Some(UploadEvent::Started));
+
+    send_to_server("ABOR\r\n", &stream).await;
+    assert_eq!(read_replies(&stream, 2).await, "426 Connection closed\r\n226 Closed data channel\r\n");
+    let _ = data_stream.shutdown().await;
+    drop(data_stream);
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap();
+    assert_eq!(ended, Some(UploadEvent::Ended(Err(std::io::ErrorKind::ConnectionAborted))));
 
     finalize().await;
 }

@@ -15,6 +15,7 @@ use crate::server::controlchan::{
     handler::{CommandContext, CommandHandler},
 };
 use async_trait::async_trait;
+use tokio::sync::mpsc::error::TrySendError;
 use unftp_core::auth::UserDetail;
 use unftp_core::storage::{Metadata, StorageBackend};
 
@@ -31,17 +32,19 @@ where
     #[tracing_attributes::instrument]
     async fn handle(&self, args: CommandContext<Storage, User>) -> Result<Reply, ControlChanError> {
         let mut session = args.session.lock().await;
-        let logger = args.logger;
-        match session.data_abort_tx.take() {
-            Some(tx) => {
-                tokio::spawn(async move {
-                    if let Err(err) = tx.send(()).await {
-                        slog::warn!(logger, "abort failed: {}", err);
-                    }
-                });
-                Ok(Reply::new(ReplyCode::ClosingDataConnection, "Closed data channel"))
-            }
-            None => Ok(Reply::new(ReplyCode::ClosingDataConnection, "Data channel already closed")),
+        let Some(tx) = session.data_abort_tx.take() else {
+            return Ok(Reply::new(ReplyCode::ClosingDataConnection, "Data channel already closed"));
+        };
+        if session.data_abort_rx.is_some() {
+            // The client has not opened the data connection, so no transfer is in progress.
+            return Ok(Reply::new(ReplyCode::ClosingDataConnection, "Closed data channel"));
+        }
+        // The data channel answers an abort it receives, after it has answered the transfer the abort
+        // cut short. It closes the channel once it is done, and then the abort is answered here.
+        let sent = tx.try_send(());
+        match sent {
+            Ok(()) | Err(TrySendError::Full(())) => Ok(Reply::none()),
+            Err(TrySendError::Closed(())) => Ok(Reply::new(ReplyCode::ClosingDataConnection, "Data channel already closed")),
         }
     }
 }

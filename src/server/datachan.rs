@@ -4,6 +4,7 @@ use super::{
     chancomms::{ControlChanMsg, DataChanMsg},
     tls::FtpsConfig,
 };
+use crate::server::controlchan::{Reply, ReplyCode};
 use crate::server::session::SharedSession;
 use crate::{
     auth::UserDetail,
@@ -15,6 +16,7 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
 use crate::metrics;
@@ -99,6 +101,75 @@ impl<R> MeasuringReader<R> {
     }
 }
 
+/// The reader a storage backend consumes for STOR and APPE.
+///
+/// Once ABOR arrives, the data connection is closed and every read fails with
+/// [`std::io::ErrorKind::ConnectionAborted`] rather than reaching EOF, so that a backend can tell an
+/// aborted upload from a finished one.
+struct AbortableReader<R> {
+    reader: Option<R>,
+    abort_rx: Option<oneshot::Receiver<()>>,
+}
+
+impl<R> AbortableReader<R> {
+    fn new(reader: R, abort_rx: oneshot::Receiver<()>) -> AbortableReader<R> {
+        Self {
+            reader: Some(reader),
+            abort_rx: Some(abort_rx),
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for AbortableReader<R> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let Some(abort_rx) = this.abort_rx.as_mut() {
+            let abort = Pin::new(abort_rx).poll(cx);
+            match abort {
+                Poll::Ready(Ok(())) => {
+                    this.abort_rx = None;
+                    // Dropping the reader closes the data connection.
+                    this.reader = None;
+                }
+                // The transfer ended without an abort.
+                Poll::Ready(Err(_)) => this.abort_rx = None,
+                Poll::Pending => {}
+            }
+        }
+        match this.reader.as_mut() {
+            Some(reader) => Pin::new(reader).poll_read(cx, buf),
+            None => Poll::Ready(Err(transfer_aborted_io_error())),
+        }
+    }
+}
+
+fn transfer_aborted_io_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "transfer aborted by ABOR")
+}
+
+/// Runs `transfer`, an upload reading from an [`AbortableReader`], until it completes. If ABOR arrives
+/// on `data_abort_rx` first, fails the reader through `abort_tx` and still waits for the backend to
+/// return. The flag tells whether the transfer was aborted.
+async fn until_complete_or_aborted<F: Future>(transfer: F, abort_tx: oneshot::Sender<()>, data_abort_rx: &mut Receiver<()>) -> (F::Output, bool) {
+    let mut transfer = std::pin::pin!(transfer);
+    tokio::select! {
+        output = &mut transfer => (output, false),
+        Some(()) = data_abort_rx.recv() => {
+            let _ = abort_tx.send(());
+            (transfer.await, true)
+        }
+    }
+}
+
+/// Answers ABOR once whatever it aborted has been answered (RFC 959, section 4.1.3).
+async fn send_abor_reply(tx: &Sender<ControlChanMsg>, logger: &slog::Logger) {
+    let reply = ControlChanMsg::CommandChannelReply(Reply::new(ReplyCode::ClosingDataConnection, "Closed data channel"));
+    let sent = tx.send(reply).await;
+    if let Err(err) = sent {
+        slog::warn!(logger, "Could not send the ABOR reply to the control channel: {:?}", err);
+    }
+}
+
 impl<Storage, User> DataCommandExecutor<Storage, User>
 where
     Storage: StorageBackend<User> + 'static,
@@ -108,9 +179,13 @@ where
     async fn execute(mut self, session_arc: SharedSession<Storage, User>) {
         let mut data_cmd_rx = self.data_cmd_rx.take().unwrap();
         let mut data_abort_rx = self.data_abort_rx.take().unwrap();
+        let control_msg_tx = self.control_msg_tx.clone();
+        let logger = self.logger.clone();
         let mut timeout_delay = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(5 * 60)));
         // TODO: Use configured timeout
         tokio::select! {
+            // A command already sent is run, so that ABOR right after it aborts it rather than replacing it.
+            biased;
             Some(command) = data_cmd_rx.recv() => {
                 let start_pos = match command {
                     // A REST offset applies only to the transfer command that immediately follows it
@@ -121,44 +196,53 @@ where
                     }
                     DataChanCmd::List { .. } | DataChanCmd::Nlst { .. } | DataChanCmd::Mlsd { .. } => 0,
                 };
-                self.handle_incoming(DataChanMsg::ExternalCommand(command), start_pos).await;
+                self.handle_incoming(DataChanMsg::ExternalCommand(command), start_pos, &mut data_abort_rx).await;
             },
             Some(_) = data_abort_rx.recv() => {
-                self.handle_incoming(DataChanMsg::Abort, 0).await;
+                self.handle_incoming(DataChanMsg::Abort, 0, &mut data_abort_rx).await;
             },
             _ = &mut timeout_delay => {
                 slog::warn!(self.logger, "Data channel connection timed out");
             }
         };
+        // An ABOR that arrives once the command is done finds nothing in progress and only gets a 226
+        // (RFC 959, section 4.1.3). Closing the channel makes the ABOR handler answer any later one
+        // itself; one that is already queued is answered here.
+        data_abort_rx.close();
+        let late_abort = data_abort_rx.try_recv();
+        if late_abort.is_ok() {
+            send_abor_reply(&control_msg_tx, &logger).await;
+        }
         let mut session = session_arc.lock().await;
         session.data_busy = false;
     }
 
     #[tracing_attributes::instrument]
-    async fn handle_incoming(self, incoming: DataChanMsg, start_pos: u64) {
+    async fn handle_incoming(self, incoming: DataChanMsg, start_pos: u64, data_abort_rx: &mut Receiver<()>) {
         match incoming {
             DataChanMsg::Abort => {
                 slog::info!(self.logger, "Data channel abort received");
+                send_abor_reply(&self.control_msg_tx, &self.logger).await;
             }
             DataChanMsg::ExternalCommand(command) => {
                 let p = command.path().unwrap_or_default();
                 slog::debug!(self.logger, "Data channel command received: {:?}", command; "path" => p);
-                self.execute_command(command, start_pos).await;
+                self.execute_command(command, start_pos, data_abort_rx).await;
             }
         }
     }
 
     #[tracing_attributes::instrument]
-    async fn execute_command(self, cmd: DataChanCmd, start_pos: u64) {
+    async fn execute_command(self, cmd: DataChanCmd, start_pos: u64, data_abort_rx: &mut Receiver<()>) {
         match cmd {
             DataChanCmd::Retr { path } => {
                 self.exec_retr(path, start_pos).await;
             }
             DataChanCmd::Stor { path } => {
-                self.exec_stor(path, start_pos).await;
+                self.exec_stor(path, start_pos, data_abort_rx).await;
             }
             DataChanCmd::Appe { path } => {
-                self.exec_appe(path).await;
+                self.exec_appe(path, data_abort_rx).await;
             }
             DataChanCmd::List { path, .. } => {
                 self.exec_list_variant(path, ListCommand::List).await;
@@ -268,20 +352,16 @@ where
     }
 
     #[tracing_attributes::instrument]
-    async fn exec_stor(self, path: String, start_pos: u64) {
+    async fn exec_stor(self, path: String, start_pos: u64, data_abort_rx: &mut Receiver<()>) {
         let path = self.cwd.join(path);
         let tx = self.control_msg_tx.clone();
 
         let start_time = Instant::now();
-        let put_result = self
-            .storage
-            .put(
-                (*self.user).as_ref().unwrap(),
-                Self::reader(self.socket, self.ftps_mode, "stor").await,
-                path.clone(),
-                start_pos,
-            )
-            .await;
+        let (abort_tx, abort_rx) = oneshot::channel();
+        let input = AbortableReader::new(Self::reader(self.socket, self.ftps_mode, "stor").await, abort_rx);
+        let put = self.storage.put((*self.user).as_ref().unwrap(), input, path.clone(), start_pos);
+        let (put_result, aborted) = until_complete_or_aborted(put, abort_tx, data_abort_rx).await;
+        let put_result = Self::abort_result(&self.logger, "STOR", put_result, aborted);
         let duration = start_time.elapsed();
 
         match put_result {
@@ -324,10 +404,24 @@ where
                 }
             }
         }
+
+        if aborted {
+            send_abor_reply(&tx, &self.logger).await;
+        }
+    }
+
+    /// Replaces the outcome of an upload cut by ABOR with the 426 reply that RFC 959 (section 4.1.3)
+    /// requires, whatever the backend made of the failed read.
+    fn abort_result(logger: &slog::Logger, command: &str, put_result: Result<u64, Error>, aborted: bool) -> Result<u64, Error> {
+        if !aborted {
+            return put_result;
+        }
+        slog::info!(logger, "{} aborted by the client; the storage backend returned {:?}", command, put_result);
+        Err(Error::new(ErrorKind::ConnectionClosed, transfer_aborted_io_error()))
     }
 
     #[tracing_attributes::instrument]
-    async fn exec_appe(self, path: String) {
+    async fn exec_appe(self, path: String, data_abort_rx: &mut Receiver<()>) {
         let path = self.cwd.join(&path);
         let tx = self.control_msg_tx.clone();
 
@@ -338,15 +432,11 @@ where
         };
 
         let start_time = Instant::now();
-        let put_result = self
-            .storage
-            .put(
-                (*self.user).as_ref().unwrap(),
-                Self::reader(self.socket, self.ftps_mode, "appe").await,
-                path.clone(),
-                start_pos,
-            )
-            .await;
+        let (abort_tx, abort_rx) = oneshot::channel();
+        let input = AbortableReader::new(Self::reader(self.socket, self.ftps_mode, "appe").await, abort_rx);
+        let put = self.storage.put((*self.user).as_ref().unwrap(), input, path.clone(), start_pos);
+        let (put_result, aborted) = until_complete_or_aborted(put, abort_tx, data_abort_rx).await;
+        let put_result = Self::abort_result(&self.logger, "APPE", put_result, aborted);
         let duration = start_time.elapsed();
 
         match put_result {
@@ -382,6 +472,10 @@ where
                     slog::error!(self.logger, "Could not notify control channel of error with APPE: {:?}", err);
                 }
             }
+        }
+
+        if aborted {
+            send_abor_reply(&tx, &self.logger).await;
         }
     }
 
