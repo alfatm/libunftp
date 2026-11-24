@@ -432,10 +432,21 @@ where
         let path = self.cwd.join(&path);
         let tx = self.control_msg_tx.clone();
 
-        // Get current file size, or 0 if file doesn't exist
-        let start_pos = match self.storage.metadata((*self.user).as_ref().unwrap(), &path).await {
+        // Append at the current file size, or at 0 when the file does not exist. Any other failure
+        // ends the command before data is read: starting at 0 would overwrite the file.
+        let metadata = self.storage.metadata((*self.user).as_ref().unwrap(), &path).await;
+        let start_pos = match metadata {
             Ok(meta) => meta.len(),
-            Err(_) => 0,
+            Err(err) if err.kind() == ErrorKind::PermanentFileNotAvailable => 0,
+            Err(err) => {
+                slog::warn!(self.logger, "Could not get the size of {:?} to APPE to: {:?}", &path, err);
+                categorize_and_register_error(&self.logger, &err, "appe");
+                let sent = tx.send(ControlChanMsg::StorageError(err)).await;
+                if let Err(err) = sent {
+                    slog::error!(self.logger, "Could not notify control channel of error with APPE: {:?}", err);
+                }
+                return;
+            }
         };
 
         let start_time = Instant::now();

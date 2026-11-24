@@ -38,6 +38,9 @@ const CONTENT: &str = "0123456789abcdef";
 /// `put` refuses files whose name starts with this.
 const REFUSED: &str = "refused";
 
+/// `metadata` refuses files whose name starts with this; every other file does not exist.
+const UNREADABLE: &str = "unreadable";
+
 /// The backend reports to the [`probe`] of files whose name starts with this what it reads.
 const WATCHED: &str = "watched";
 
@@ -150,7 +153,10 @@ impl StorageBackend<DefaultUser> for TestStorage {
         FEATURE_RESTART
     }
 
-    async fn metadata<P: AsRef<Path> + Send + Debug>(&self, _user: &DefaultUser, _path: P) -> Result<Self::Metadata> {
+    async fn metadata<P: AsRef<Path> + Send + Debug>(&self, _user: &DefaultUser, path: P) -> Result<Self::Metadata> {
+        if file_name(path.as_ref()).starts_with(UNREADABLE) {
+            return Err(Error::from(ErrorKind::PermissionDenied));
+        }
         Err(Error::from(ErrorKind::PermanentFileNotAvailable))
     }
 
@@ -545,6 +551,25 @@ async fn abor_right_after_stor_aborts_it() {
     assert_eq!(client.reply().await, "426 Connection closed; transfer aborted");
     assert_eq!(client.reply().await, "226 Closed data channel");
     assert_eq!(next(&mut seen).await, Seen::Ended(Err(std::io::ErrorKind::ConnectionAborted)));
+    drop(data);
+
+    finalize().await;
+}
+
+// APPE appends at the current size of the file, and starts a new file only when there is none. A
+// failure to read the size is not a missing file: taking it for one would overwrite the file with
+// the appended data alone.
+#[tokio::test(flavor = "current_thread")]
+async fn appe_fails_when_the_size_of_the_file_cannot_be_read() {
+    initialize().await;
+    let mut client = Client::login().await;
+
+    let addr = client.pasv().await;
+    client.command(&format!("APPE {UNREADABLE}.txt"), "150 Ready to receive data").await;
+    let mut data = tcp_pasv_connect(addr).await.unwrap();
+    data.write_all(b"appended").await.unwrap();
+    data.shutdown().await.unwrap();
+    assert_eq!(client.reply().await, "550 Permission denied");
     drop(data);
 
     finalize().await;
