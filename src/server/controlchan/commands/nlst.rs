@@ -49,11 +49,13 @@ where
         let logger = args.logger;
         match session.data_cmd_tx.take() {
             Some(tx) => {
-                tokio::spawn(async move {
-                    if let Err(err) = tx.send(cmd).await {
-                        slog::warn!(logger, "NLST: could not notify data channel to respond with NLST. {}", err);
-                    }
-                });
+                // Queued before the next command is read, so that the data channel gets it before an ABOR
+                // that follows it.
+                let sent = tx.try_send(cmd);
+                if let Err(err) = sent {
+                    slog::warn!(logger, "NLST: could not notify data channel to respond with NLST. {}", err);
+                    return Ok(Reply::new(ReplyCode::CantOpenDataConnection, "No data connection established"));
+                }
                 Ok(Reply::new(ReplyCode::FileStatusOkay, "Sending directory list"))
             }
             None => {

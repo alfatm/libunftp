@@ -37,11 +37,13 @@ where
         let logger = args.logger;
         match session.data_cmd_tx.take() {
             Some(tx) => {
-                tokio::spawn(async move {
-                    if let Err(err) = tx.send(DataChanCmd::Stor { path, start_pos }).await {
-                        slog::warn!(logger, "STOU: could not send Stor command over data channel. {}", err);
-                    }
-                });
+                // Queued before the next command is read, so that the data channel gets it before an ABOR
+                // that follows it.
+                let sent = tx.try_send(DataChanCmd::Stor { path, start_pos });
+                if let Err(err) = sent {
+                    slog::warn!(logger, "STOU: could not send Stor command over data channel. {}", err);
+                    return Ok(Reply::new(ReplyCode::CantOpenDataConnection, "No data connection established"));
+                }
                 Ok(Reply::new_with_string(ReplyCode::FileStatusOkay, filename.to_string_lossy().to_string()))
             }
             None => {
