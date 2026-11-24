@@ -34,6 +34,9 @@ const REFUSED: &str = "refused";
 /// `put` reports to [`WATCHED_UPLOADS`] how it reads files whose name starts with this.
 const WATCHED: &str = "watched";
 
+/// `metadata` refuses files whose name starts with this; every other file does not exist.
+const UNREADABLE: &str = "unreadable";
+
 #[derive(Debug, PartialEq)]
 enum UploadEvent {
     /// The backend has read the first bytes.
@@ -100,7 +103,10 @@ impl StorageBackend<DefaultUser> for TestStorage {
         FEATURE_RESTART
     }
 
-    async fn metadata<P: AsRef<Path> + Send + Debug>(&self, _user: &DefaultUser, _path: P) -> Result<Self::Metadata> {
+    async fn metadata<P: AsRef<Path> + Send + Debug>(&self, _user: &DefaultUser, path: P) -> Result<Self::Metadata> {
+        if file_name(path.as_ref()).starts_with(UNREADABLE) {
+            return Err(Error::from(ErrorKind::PermissionDenied));
+        }
         Err(Error::from(ErrorKind::PermanentFileNotAvailable))
     }
 
@@ -336,6 +342,28 @@ async fn abor_fails_the_upload_the_backend_is_reading() {
 
     let ended = tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap();
     assert_eq!(ended, Some(UploadEvent::Ended(Err(std::io::ErrorKind::ConnectionAborted))));
+
+    finalize().await;
+}
+
+// APPE appends at the current size of the file, and starts a new file only when there is none. A
+// failure to read the size is not a missing file: taking it for one would overwrite the file with
+// the appended data alone.
+#[tokio::test(flavor = "current_thread")]
+async fn appe_fails_when_the_size_of_the_file_cannot_be_read() {
+    initialize().await;
+
+    let stream = tcp_connect().await.unwrap();
+    let mut buffer = vec![0_u8; 1024];
+    login(&stream, &mut buffer).await;
+
+    let addr = pasv(&stream, &mut buffer).await;
+    send_to_server(&format!("APPE {UNREADABLE}.txt\r\n"), &stream).await;
+    assert_eq!(read_from_server(&mut buffer, &stream).await, "150 Ready to receive data\r\n");
+    let mut data_stream = tcp_pasv_connect(addr).await.unwrap();
+    let _ = data_stream.shutdown().await;
+    assert_eq!(read_from_server(&mut buffer, &stream).await, "550 Permission denied\r\n");
+    drop(data_stream);
 
     finalize().await;
 }
