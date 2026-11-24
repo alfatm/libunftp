@@ -21,6 +21,7 @@ use crate::{
     server::{
         ControlChanMsg,
         chancomms::DataChanCmd,
+        controlchan::commands::passive_common,
         controlchan::{
             Reply, ReplyCode,
             error::ControlChanError,
@@ -83,6 +84,11 @@ where
             session,
             ..
         } = args;
+
+        let refusal = passive_common::refuse_during_transfer(&session).await;
+        if let Some(reply) = refusal {
+            return Ok(reply);
+        }
 
         let bytes: Vec<u8> = self.addr.split(',').map(|x| x.parse::<u8>()).filter_map(Result::ok).collect();
         if bytes.len() != 6 {

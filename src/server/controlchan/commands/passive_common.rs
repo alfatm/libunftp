@@ -61,6 +61,22 @@ pub(crate) fn try_port_range(local_addr: SocketAddr, passive_ports: RangeInclusi
 
 // modifies the session by adding channels that are used to communicate with the data connection
 // processing loop.
+/// Refuses a new data connection while a transfer is in progress. Setting one up would replace the
+/// channels to the running transfer, so that a later ABOR could no longer reach it. The client can ask
+/// again once the transfer is done, so the reply is the transient 425.
+pub(crate) async fn refuse_during_transfer<S, U>(session: &SharedSession<S, U>) -> Option<Reply>
+where
+    U: UserDetail + 'static,
+    S: StorageBackend<U> + 'static,
+    S::Metadata: Metadata,
+{
+    let session = session.lock().await;
+    if session.transfer_in_progress() {
+        return Some(Reply::new(ReplyCode::CantOpenDataConnection, "A transfer is in progress"));
+    }
+    None
+}
+
 #[tracing_attributes::instrument]
 pub(crate) async fn setup_inter_loop_comms<S, U>(session: SharedSession<S, U>, control_loop_tx: Sender<ControlChanMsg>)
 where
@@ -89,6 +105,10 @@ where
     S::Metadata: Metadata,
     T: LegacyReplyProducer<S, U>,
 {
+    let refusal = refuse_during_transfer(&args.session).await;
+    if let Some(reply) = refusal {
+        return Ok(reply);
+    }
     let listener = match args.session.lock().await.binder {
         Some(ref mut binder) => binder.bind(args.local_addr.ip(), args.passive_ports.clone()).await,
         _ => try_port_range(args.local_addr, args.passive_ports.clone()),
@@ -129,6 +149,10 @@ where
     S: StorageBackend<U> + 'static,
     S::Metadata: Metadata,
 {
+    let refusal = refuse_during_transfer(&args.session).await;
+    if let Some(reply) = refusal {
+        return Ok(reply);
+    }
     setup_inter_loop_comms(args.session.clone(), args.tx_control_chan).await;
 
     let (oneshot_tx, oneshot_rx) = oneshot::channel::<Result<Reply, PortAllocationError>>();

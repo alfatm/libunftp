@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use common::{TestAuthenticator, tcp_pasv_connect};
 use lazy_static::lazy_static;
 use libunftp::ServerBuilder;
+use libunftp::options::ActivePassiveMode;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Cursor;
@@ -21,8 +22,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use unftp_core::auth::DefaultUser;
 use unftp_core::storage::{Error, ErrorKind, FEATURE_RESTART, Fileinfo, Metadata, Result, StorageBackend};
@@ -250,6 +251,7 @@ async fn run_with_test_storage() {
     let server = ServerBuilder::new(Box::new(|| TestStorage))
         .authenticator(Arc::new(TestAuthenticator {}))
         .greeting("Welcome test")
+        .active_passive_mode(ActivePassiveMode::ActiveAndPassive)
         .build()
         .unwrap();
     server.listen(ADDR).await.unwrap();
@@ -571,6 +573,37 @@ async fn appe_fails_when_the_size_of_the_file_cannot_be_read() {
     data.shutdown().await.unwrap();
     assert_eq!(client.reply().await, "550 Permission denied");
     drop(data);
+
+    finalize().await;
+}
+
+// A new data connection set up during a transfer would replace the channels to it, so that an ABOR could
+// no longer reach it. PASV, EPSV and PORT are refused until the transfer is done.
+#[tokio::test(flavor = "current_thread")]
+async fn no_new_data_connection_during_a_transfer() {
+    initialize().await;
+    let mut client = Client::login().await;
+    let name = format!("{HELD}-download-busy.txt");
+    let (_seen, release) = probe(&name);
+
+    let addr = client.pasv().await;
+    client.command(&format!("RETR {name}"), "150 Sending data").await;
+    let mut data = tcp_pasv_connect(addr).await.unwrap();
+    let mut first = [0_u8; CONTENT.len() / 2];
+    tokio::time::timeout(PATIENCE, data.read_exact(&mut first)).await.unwrap().unwrap();
+
+    client.command("PASV", "425 A transfer is in progress").await;
+    client.command("EPSV", "425 A transfer is in progress").await;
+    let active = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = active.local_addr().unwrap().port();
+    client
+        .command(&format!("PORT 127,0,0,1,{},{}", port >> 8, port & 0xff), "425 A transfer is in progress")
+        .await;
+
+    release.send(()).unwrap();
+    read_to_end(data).await;
+    assert_eq!(client.reply().await, "226 Successfully sent");
+    client.pasv().await;
 
     finalize().await;
 }

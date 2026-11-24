@@ -184,6 +184,12 @@ where
         self.failed_logins = failed_logins;
         self
     }
+
+    /// Tells if a transfer command was handed to a data connection that is still open, that is, if a
+    /// transfer is in progress.
+    pub fn transfer_in_progress(&self) -> bool {
+        self.data_busy && self.data_cmd_tx.is_none()
+    }
 }
 
 impl<Storage, User> Drop for Session<Storage, User>
