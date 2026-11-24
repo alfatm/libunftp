@@ -25,10 +25,14 @@ pub enum DataChanCmd {
     Retr {
         /// The path to the file the client would like to retrieve.
         path: String,
+        /// The offset set by a `REST` command right before this one, or 0.
+        start_pos: u64,
     },
     Stor {
         /// The path to the file the client would like to store.
         path: String,
+        /// The offset set by a `REST` command right before this one, or 0.
+        start_pos: u64,
     },
     Appe {
         /// The path to the file the client would like to append to.

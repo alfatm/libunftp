@@ -28,6 +28,9 @@ where
     #[tracing_attributes::instrument]
     async fn handle(&self, args: CommandContext<Storager, User>) -> Result<Reply, ControlChanError> {
         let mut session = args.session.lock().await;
+        // A REST offset applies to the transfer command right after it (RFC 959, section 4.1.3), so this
+        // command consumes it, whether or not the transfer then starts.
+        let start_pos = std::mem::take(&mut session.start_pos);
         let uuid: String = Uuid::new_v4().to_string();
         let filename: &Path = std::path::Path::new(&uuid);
         let path: String = session.cwd.join(filename).to_string_lossy().to_string();
@@ -35,7 +38,7 @@ where
         match session.data_cmd_tx.take() {
             Some(tx) => {
                 tokio::spawn(async move {
-                    if let Err(err) = tx.send(DataChanCmd::Stor { path }).await {
+                    if let Err(err) = tx.send(DataChanCmd::Stor { path, start_pos }).await {
                         slog::warn!(logger, "STOU: could not send Stor command over data channel. {}", err);
                     }
                 });

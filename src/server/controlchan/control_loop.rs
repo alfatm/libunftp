@@ -402,18 +402,10 @@ where
         match msg {
             NotFound => Ok(Reply::new(ReplyCode::FileError, "File not found")),
             PermissionDenied => Ok(Reply::new(ReplyCode::FileError, "Permision denied")),
-            SentData { .. } => {
-                let mut session = self.session.lock().await;
-                session.start_pos = 0;
-                Ok(Reply::new(ReplyCode::ClosingDataConnection, "Successfully sent"))
-            }
+            SentData { .. } => Ok(Reply::new(ReplyCode::ClosingDataConnection, "Successfully sent")),
             WriteFailed => Ok(Reply::new(ReplyCode::TransientFileError, "Failed to write file")),
             ConnectionReset => Ok(Reply::new(ReplyCode::ConnectionClosed, "Datachannel unexpectedly closed")),
-            WrittenData { .. } => {
-                let mut session = self.session.lock().await;
-                session.start_pos = 0;
-                Ok(Reply::new(ReplyCode::ClosingDataConnection, "File successfully written"))
-            }
+            WrittenData { .. } => Ok(Reply::new(ReplyCode::ClosingDataConnection, "File successfully written")),
             DataConnectionClosedAfterStor => Ok(Reply::new(ReplyCode::FileActionOkay, "unFTP holds your data for you")),
             DirectorySuccessfullyListed => Ok(Reply::new(ReplyCode::ClosingDataConnection, "Listed the directory")),
             DirectoryListFailure => Ok(Reply::new(ReplyCode::ClosingDataConnection, "Failed to list the directory")),

@@ -32,6 +32,9 @@ where
     #[tracing_attributes::instrument]
     async fn handle(&self, args: CommandContext<Storage, User>) -> Result<Reply, ControlChanError> {
         let mut session = args.session.lock().await;
+        // APPE writes at the end of the file, so a REST offset right before it has no effect. It is
+        // consumed all the same: it applies to the transfer command right after it (RFC 959, section 4.1.3).
+        session.start_pos = 0;
 
         let (cmd, path): (DataChanCmd, String) = match args.parsed_command.clone() {
             Command::Appe { path } => {

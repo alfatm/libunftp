@@ -34,10 +34,13 @@ where
     #[tracing_attributes::instrument]
     async fn handle(&self, args: CommandContext<Storage, User>) -> Result<Reply, ControlChanError> {
         let mut session = args.session.lock().await;
+        // A REST offset applies to the transfer command right after it (RFC 959, section 4.1.3), so this
+        // command consumes it, whether or not the transfer then starts.
+        let start_pos = std::mem::take(&mut session.start_pos);
         let (cmd, path): (DataChanCmd, String) = match args.parsed_command.clone() {
             Command::Retr { path } => {
                 let path_clone = path.clone();
-                (DataChanCmd::Retr { path }, path_clone)
+                (DataChanCmd::Retr { path, start_pos }, path_clone)
             }
             _ => panic!("Programmer error, expected command to be RETR"),
         };

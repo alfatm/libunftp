@@ -112,11 +112,11 @@ where
         // TODO: Use configured timeout
         tokio::select! {
             Some(command) = data_cmd_rx.recv() => {
-                let session = session_arc.lock().await;
-                self.handle_incoming(DataChanMsg::ExternalCommand(command), session.start_pos).await;
+                let _session = session_arc.lock().await;
+                self.handle_incoming(DataChanMsg::ExternalCommand(command)).await;
             },
             Some(_) = data_abort_rx.recv() => {
-                self.handle_incoming(DataChanMsg::Abort, 0).await;
+                self.handle_incoming(DataChanMsg::Abort).await;
             },
             _ = &mut timeout_delay => {
                 slog::warn!(self.logger, "Data channel connection timed out");
@@ -127,7 +127,7 @@ where
     }
 
     #[tracing_attributes::instrument]
-    async fn handle_incoming(self, incoming: DataChanMsg, start_pos: u64) {
+    async fn handle_incoming(self, incoming: DataChanMsg) {
         match incoming {
             DataChanMsg::Abort => {
                 slog::info!(self.logger, "Data channel abort received");
@@ -135,18 +135,18 @@ where
             DataChanMsg::ExternalCommand(command) => {
                 let p = command.path().unwrap_or_default();
                 slog::debug!(self.logger, "Data channel command received: {:?}", command; "path" => p);
-                self.execute_command(command, start_pos).await;
+                self.execute_command(command).await;
             }
         }
     }
 
     #[tracing_attributes::instrument]
-    async fn execute_command(self, cmd: DataChanCmd, start_pos: u64) {
+    async fn execute_command(self, cmd: DataChanCmd) {
         match cmd {
-            DataChanCmd::Retr { path } => {
+            DataChanCmd::Retr { path, start_pos } => {
                 self.exec_retr(path, start_pos).await;
             }
-            DataChanCmd::Stor { path } => {
+            DataChanCmd::Stor { path, start_pos } => {
                 self.exec_stor(path, start_pos).await;
             }
             DataChanCmd::Appe { path } => {
